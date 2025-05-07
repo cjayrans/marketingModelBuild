@@ -159,7 +159,9 @@ def get_pipeline(
         default_value=f"s3://sagemaker-servicecatalog-seedcode-{region}/dataset/abalone-dataset.csv",
     )
 
-    # processing step for feature engineering
+    # Processing step for feature engineering
+
+    # Define containerized environment: Encapsulates the environment definition for the broader preprocessing step
     sklearn_processor = SKLearnProcessor(
         framework_version="0.23-1",
         instance_type=processing_instance_type,
@@ -168,6 +170,7 @@ def get_pipeline(
         sagemaker_session=pipeline_session,
         role=role,
     )
+    # Configure job I/O and script: Defines how the SKLearnProcessor will execute its job - declaring exact inputs/outputs and parameters for this step
     step_args = sklearn_processor.run(
         outputs=[
             ProcessingOutput(output_name="train", source="/opt/ml/processing/train"),
@@ -177,13 +180,17 @@ def get_pipeline(
         code=os.path.join(BASE_DIR, "preprocess.py"),
         arguments=["--input-data", input_data],
     )
+    # Register step in pipeline graph: Wraps the preprocessing run configuration (step_args) into a named pipeline step that can be chained to other steps.
     step_process = ProcessingStep(
         name="PreprocessAbaloneData",
         step_args=step_args,
     )
 
-    # training step for generating model artifacts
+    # TRAINING STEP FOR GENERATING MODEL ARTIFACTS
+    # S3 destination for trained model
     model_path = f"s3://{sagemaker_session.default_bucket()}/{base_job_prefix}/AbaloneTrain"
+    
+    # Select XGBoost training environment: Retrieves the Docker image URI for the SageMaker-provided XGBoost container
     image_uri = sagemaker.image_uris.retrieve(
         framework="xgboost",
         region=region,
@@ -191,6 +198,7 @@ def get_pipeline(
         py_version="py3",
         instance_type=training_instance_type,
     )
+    # Defines the training job configuration using SageMaker’s Estimator
     xgb_train = Estimator(
         image_uri=image_uri,
         instance_type=training_instance_type,
@@ -200,6 +208,7 @@ def get_pipeline(
         sagemaker_session=pipeline_session,
         role=role,
     )
+    # Sets the model's training hyperparameters (specific to XGBoost)
     xgb_train.set_hyperparameters(
         objective="reg:linear",
         num_round=50,
@@ -210,9 +219,13 @@ def get_pipeline(
         subsample=0.7,
         silent=0,
     )
+    # Execute training using preprocessed data
+    # Runs the training job by specifying the S3 inputs created by the preprocessing step (step_process)
+    # This is a dependency chain: the training step now officially depends on the outputs of the preprocessing step.
     step_args = xgb_train.fit(
         inputs={
-            "train": TrainingInput(
+            "train": TrainingInput( # Wraps that path (S3 URI note below) as input to SageMaker's built-in training API
+                # Dynamically grabs the output S3 URI from the preprocessing step
                 s3_data=step_process.properties.ProcessingOutputConfig.Outputs[
                     "train"
                 ].S3Output.S3Uri,
@@ -226,14 +239,18 @@ def get_pipeline(
             ),
         },
     )
+    # Register in pipeline: Wraps the fit(...) call into a named SageMaker TrainingStep to be included in the pipeline DAG
     step_train = TrainingStep(
-        name="TrainAbaloneModel",
+        name="TrainAbaloneModel", # Clearly named steps show up in SageMaker Studio's visual pipeline graph
         step_args=step_args,
     )
 
-    # processing step for evaluation
-    script_eval = ScriptProcessor(
-        image_uri=image_uri,
+    # PROCESSING STEP FOR EVALUATION
+    # This step runs the evaluate.py script inside a Python container and stores its outputs for use in a conditional logic step
+    
+    # Defines the environment for running a custom Python evaluation script
+    script_eval = ScriptProcessor( # runs arbitrary Python scripts inside containers
+        image_uri=image_uri, # reuses the XGBoost container (which includes Python + dependencies)
         command=["python3"],
         instance_type=processing_instance_type,
         instance_count=1,
@@ -241,73 +258,102 @@ def get_pipeline(
         sagemaker_session=pipeline_session,
         role=role,
     )
+    # Tells the ScriptProcessor how to run the evaluation job
     step_args = script_eval.run(
         inputs=[
             ProcessingInput(
-                source=step_train.properties.ModelArtifacts.S3ModelArtifacts,
-                destination="/opt/ml/processing/model",
+                source=step_train.properties.ModelArtifacts.S3ModelArtifacts, # Pulled from the training step’s output (model.tar.gz)
+                destination="/opt/ml/processing/model", # Placed into /opt/ml/processing/model inside the container
             ),
             ProcessingInput(
-                source=step_process.properties.ProcessingOutputConfig.Outputs[
+                source=step_process.properties.ProcessingOutputConfig.Outputs[ 
                     "test"
-                ].S3Output.S3Uri,
-                destination="/opt/ml/processing/test",
+                ].S3Output.S3Uri, # Comes from the preprocessing step
+                destination="/opt/ml/processing/test", # Placed into /opt/ml/processing/test
             ),
         ],
         outputs=[
-            ProcessingOutput(output_name="evaluation", source="/opt/ml/processing/evaluation"),
+            ProcessingOutput(output_name="evaluation", source="/opt/ml/processing/evaluation"), # Evaluation results (MSE + stddev) written to /opt/ml/processing/evaluation
         ],
-        code=os.path.join(BASE_DIR, "evaluate.py"),
+        code=os.path.join(BASE_DIR, "evaluate.py"), # The evaluate.py script writes the resulting JSON output containing evaluation results 
     )
+    # Registers the location of the evaluation output so it can be referenced by name and path in later steps
     evaluation_report = PropertyFile(
         name="AbaloneEvaluationReport",
-        output_name="evaluation",
-        path="evaluation.json",
+        output_name="evaluation", # use of "evaluation" must match the name in ProcessingOutput(...)
+        path="evaluation.json", # is the exact file written by evaluate.py containing evaluation metric results - This allows downstream steps (like ConditionStep) to extract the MSE value with JsonGet(...)
     )
+    # Wraps the evaluation logic into a named pipeline step
+    # Stores evaluation.json as part of the pipeline’s metadata
+    # Makes outputs available to ConditionStep logic
     step_eval = ProcessingStep(
         name="EvaluateAbaloneModel",
         step_args=step_args,
         property_files=[evaluation_report],
     )
 
-    # register model step that will be conditionally executed
-    model_metrics = ModelMetrics(
+    # REGISTER MODEL STEP THAT WILL BE CONDITIONALLY EXECUTED - CONTAINS TWO SUB-SECTIONS
+    # 1. Model registration logic (defining how the model is registered if approved)
+    # 2. A conditional branch that checks whether the model meets quality requirements before allowing registration
+
+    # Defines model evaluation metrics (in this case, MSE) to be associated with the model in the SageMaker Model Registry
+    model_metrics = ModelMetrics( # ModelMetrics object → Attached to the model package when it’s registered
         model_statistics=MetricsSource(
             s3_uri="{}/evaluation.json".format(
-                step_eval.arguments["ProcessingOutputConfig"]["Outputs"][0]["S3Output"]["S3Uri"]
+                step_eval.arguments["ProcessingOutputConfig"]["Outputs"][0]["S3Output"]["S3Uri"] # step_eval.arguments["..."] → Dynamically resolves the path to evaluation.json
             ),
             content_type="application/json"
         )
     )
+
+    # Defines a SageMaker Model object using:
+        # The training step’s model artifact (model.tar.gz)
+        # The same container image used during training (image_uri)
+    # This creates a deployable MODEL OBJECT that can be used for:
+        # Real-time inference (SageMaker Endpoint)
+        # Batch transform
+        # Model registration
     model = Model(
         image_uri=image_uri,
         model_data=step_train.properties.ModelArtifacts.S3ModelArtifacts,
         sagemaker_session=pipeline_session,
         role=role,
     )
+
+    # Registers the model to a Model Package Group in the SageMaker Model Registry
+    # Enables governance, versioning, and deployment approval workflows
+    # Central place to store models before deployment
     step_args = model.register(
         content_types=["text/csv"],
         response_types=["text/csv"],
         inference_instances=["ml.t2.medium", "ml.m5.large"],
         transform_instances=["ml.m5.large"],
-        model_package_group_name=model_package_group_name,
+        model_package_group_name=model_package_group_name, # Groups versions of the same model lineage (e.g., "AbalonePackageGroup")
         approval_status=model_approval_status,
-        model_metrics=model_metrics,
+        model_metrics=model_metrics, # Injects evaluation results to be stored as meta data in model registry
     )
+
+    # Creates a pipeline step to register the model — but this step won’t run automatically. It will be conditionally triggered in the next block
     step_register = ModelStep(
         name="RegisterAbaloneModel",
         step_args=step_args,
     )
 
-    # condition step for evaluating model quality and branching execution
-    cond_lte = ConditionLessThanOrEqualTo(
-        left=JsonGet(
+    # Condition step for evaluating model quality and branching execution
+    # Checks the MSE value from evaluation.json. If mse <= 6.0, the condition is met
+    # This is your model quality gate — only models that perform well get registered and become candidates for deployment.
+    cond_lte = ConditionLessThanOrEqualTo( # Allows branching based on this metric
+        left=JsonGet( # pulls the MSE value out of the evaluation_report
             step_name=step_eval.name,
             property_file=evaluation_report,
             json_path="regression_metrics.mse.value"
         ),
         right=6.0,
     )
+
+     # Creates a conditional pipeline branch:
+        # If the MSE condition passes → run step_register
+        # If not → do nothing (or you could add alerts, logging, etc.)
     step_cond = ConditionStep(
         name="CheckMSEAbaloneEvaluation",
         conditions=[cond_lte],
@@ -315,17 +361,18 @@ def get_pipeline(
         else_steps=[],
     )
 
-    # pipeline instance
+    # PIPELINE INSTANCE
+    # Ties together everything into a unified pipeline definition that you can create, update, or start programmatically
     pipeline = Pipeline(
-        name=pipeline_name,
-        parameters=[
+        name=pipeline_name, # The name you will see in the SageMaker UI (e.g., “AbalonePipeline”)
+        parameters=[ # These are runtime pipeline parameters defined earlier, allowing flexibility without changing the code.
             processing_instance_type,
             processing_instance_count,
             training_instance_type,
             model_approval_status,
             input_data,
         ],
-        steps=[step_process, step_train, step_eval, step_cond],
-        sagemaker_session=pipeline_session,
+        steps=[step_process, step_train, step_eval, step_cond], # This defines the directed acyclic graph (DAG) for the pipeline
+        sagemaker_session=pipeline_session, # Connects this pipeline definition to the SageMaker session that knows how to run it in your AWS account.
     )
     return pipeline
